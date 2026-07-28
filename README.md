@@ -74,7 +74,7 @@ MIT
 
 ## Author
 
-KWWD Coding — [homepage](https://www.kwwdcoding.co.uk)
+KWWDCoding — [homepage](https://www.kwwdcoding.com)
 
 Based on "Windows 11 Taskbar Hider and Full Screen Utilizer" by Jeremi Lorenti — [Github](https://github.com/JeremiLorenti/windows11-taskbar-hider)
 
