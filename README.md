@@ -16,7 +16,8 @@ This mod fixes that by intercepting the Windows APIs the shell uses to show and 
 - **Reversible** — disable the mod (or switch away from the target app) and the taskbar and full-screen work area are restored automatically.
 - **Start menu still works** — pressing the Win key still opens the Start menu even while the taskbar is hidden.
 
-https://github.com/user-attachments/assets/891270ab-2988-41ad-a202-3c731b1fcf39
+
+https://github.com/user-attachments/assets/08ac4170-572b-4d19-84e9-2347bd0806f4
 
 ## Requirements
 
