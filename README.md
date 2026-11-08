@@ -1,21 +1,21 @@
-# Windows 11 App Specific Taskbar Hider
+# Windows 11 Keyboard-Only Taskbar Hider
 
-A [Windhawk](https://windhawk.net) mod that hides the Windows 11 taskbar and reclaims the full screen while chosen applications are running — and actually blocks Windows own hover/edge auto-reveal, so you can't accidentally bring the taskbar back by moving your mouse too close to the bottom of the screen.
+A [Windhawk](https://windhawk.net) mod that hides the Windows 11 taskbar for every application and blocks Windows' own hover/edge auto-reveal. The taskbar comes back only when you press the Windows key.
 
 ## Why this exists
 
-Windows built-in "Automatically hide the taskbar" option still pops the taskbar back up (and steals focus) the moment your cursor gets near the screen edge — which is a problem if your app has UI elements down there too, like a timeline scrollbar in DaVinci Resolve, or a horizontal scrollbar in Photoshop/InDesign. One accidental drag too far and you're fighting the taskbar instead of your project.
+Windows' "Automatically hide the taskbar" option still slides the bar back in (and steals focus) the moment the pointer reaches the screen edge. That gets in the way of anything that lives along that edge: a timeline scrollbar, a horizontal scrollbar, a status bar.
 
-This mod fixes that by intercepting the Windows APIs the shell uses to show and focus the taskbar (`ShowWindow`, `SetWindowPos`, `SetForegroundWindow`), and simply blocking those calls while your chosen app is active. The taskbar never gets a chance to appear or take focus in the first place.
+This mod takes the hover path away entirely. It hooks the shell calls that show and focus the taskbar (`ShowWindow`, `ShowWindowAsync`, `SetWindowPos`, `SetForegroundWindow`) and drops them unless you asked for the bar with the keyboard. The previous version did that only while chosen apps were running. It now stays on for every app.
 
 ## Features
 
-- **Per-app targeting** — only hides the taskbar while specific applications (by EXE name) are running, e.g. `Resolve.exe`, `Photoshop.exe`, `FL64.exe`, `InDesign.exe`.
-- **Optional focus requirement** — choose whether hiding requires the target app to be the *active* window, or just running in the background.
-- **True hover-blocking** — unlike a simple hide-on-a-timer approach, this stops Windows own auto-reveal at the source, so hovering into the taskbar's screen area does nothing while active.
-- **Reversible** — disable the mod (or switch away from the target app) and the taskbar and full-screen work area are restored automatically.
-- **Start menu still works** — pressing the Win key still opens the Start menu even while the taskbar is hidden.
-
+- **Always on** — the taskbar is hidden no matter which application is in front. There is no process list and no focus check.
+- **No hover reveal** — moving the pointer to the screen edge does not show the taskbar and does not steal focus.
+- **Windows key shows it** — a Windows-key tap (or Ctrl+Esc) shows the taskbar and opens Start, the same as usual. It stays up while Start or Search is open and while the pointer is over the bar, then hides again.
+- **Shortcut chords stay quiet** — Win+E, Win+Tab, and other Windows-key chords do not pop the bar up.
+- **Full primary screen** — while the bar is hidden, the primary monitor's work area fills the screen. Turning the mod off puts the work area back.
+- **Reversible** — the settings switch, or disabling the mod, restores the taskbar.
 
 https://github.com/user-attachments/assets/08ac4170-572b-4d19-84e9-2347bd0806f4
 
@@ -28,41 +28,37 @@ https://github.com/user-attachments/assets/08ac4170-572b-4d19-84e9-2347bd0806f4
 
 1. Install [Windhawk](https://windhawk.net) if you haven't already.
 2. Open Windhawk and go to **Explore**, then search for this mod (or use **Create New Mod** and paste in the source from this repo if it's not yet published).
-3. Click **Install**, then open the mod's **Settings** tab.
+3. Click **Install**, then enable it. The only setting is the master switch.
 
 ## Settings
 
 | Setting | Description | Default |
 |---|---|---|
-| **Enable taskbar auto-hiding** | Master switch for the mod. | `true` |
-| **Target processes** | List of EXE filenames (no path) that should trigger hiding, e.g. `Resolve.exe`, `Photoshop.exe`. | `Resolve.exe, Photoshop.exe, FL64.exe, InDesign.exe` |
-| **Require focus (not just running)** | If enabled, the taskbar only hides while a target app is the active window — switching away (e.g. to your browser) brings it back immediately. If disabled, it stays hidden as long as the target app is running at all. | `true` |
-
-You can find an app's real process name in **Task Manager → Details** tab. A few common ones:
-
-- DaVinci Resolve → `Resolve.exe`
-- Adobe Photoshop → `Photoshop.exe`
-- Adobe InDesign → `InDesign.exe`
-- FL Studio (64-bit) → `FL64.exe`
+| **Hide the taskbar** | Master switch. On: the bar stays hidden and hover cannot reveal it. Off: normal Windows taskbar behavior. | `true` |
 
 ## Usage notes
 
-- Enable Windows own "Automatically hide the taskbar" setting to ensure that the taskbar is hidden on all apps. If you have this setting off then the default Windows behaviour is to reserve space at the bottom of the screen in order to render the taskbar and you could be left with a unsuable gap.
-- The mod checks the running/focused process a few times per second, so there's a short delay (well under a second) when switching apps before the hide state updates. The hover-blocking itself is instant, since it intercepts the show attempt directly rather than reacting after the fact.
+- Leave Windows' own **Automatically hide the taskbar** setting **off**. This mod hides the bar itself. With the Windows setting on, the shell keeps trying to slide a sliver in from the edge and the two controllers fight.
+- Press the **Windows key** by itself to show the taskbar and open Start. **Ctrl+Esc** does the same thing. The bar hides again shortly after Start/Search closes and the pointer leaves the taskbar.
+- Win combined with another key (Win+E, Win+1, Win+Tab, and so on) does not show the taskbar.
+- Secondary taskbars are hidden too. The full-screen work area is applied to the primary monitor, which is the only monitor `SPI_SETWORKAREA` can change.
 
 ## Known limitations
 
-- Some applications use secondary top-level windows for palettes, popped-out panels, or plugin editors, which can briefly count as "not focused" if focus mode is enabled. If you notice the taskbar flickering back while you're clearly still using the app, this is the likely cause — switching off "Require focus" avoids it entirely.
-- Since this hooks common `user32.dll` functions process-wide within `explorer.exe`, it's possible (though not observed in testing) that it could interact with other shell features that try to show or focus the taskbar for legitimate reasons (e.g. notification flyouts). If you notice odd behavior elsewhere in the shell while the mod is active, please open an issue.
+- The bar can take a fraction of a second to hide again after you dismiss Start or move the pointer off it.
+- Notification toasts and other shell popups do not pull the taskbar out. The Windows key is the way to show it.
+- If Start or Search never becomes the foreground window, the bar still hides again after a short grace period. Press the Windows key once more to bring it back.
+- Hooking `ShowWindow` and `SetWindowPos` for the whole of `explorer.exe` can, in principle, interact with another shell feature that shows the taskbar for its own reasons. Disable the mod to restore stock behavior.
 
 ## How it works (technical)
 
-The mod runs inside `explorer.exe` (as all Windhawk mods targeting shell behavior do) and:
+The mod runs inside `explorer.exe` and:
 
-1. Polls the running process list (or current foreground window) to determine if a target app is running/focused.
-2. Sets a shared "should be hidden" flag based on that check.
-3. Hooks `ShowWindow`, `SetWindowPos`, and `SetForegroundWindow` so that, whenever the taskbar window (`Shell_TrayWnd`) is the target of a show/activate/reveal call while the flag is set, the call is silently swallowed instead of passed through.
-4. When the condition ends, hiding is lifted and the taskbar is shown and the work area restored normally.
+1. Hides every `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` and expands the primary work area to the full monitor.
+2. Hooks `ShowWindow`, `ShowWindowAsync`, `SetWindowPos`, and `SetForegroundWindow`. While the bar is supposed to be hidden, show and activate calls aimed at a taskbar window are dropped, and `SetWindowPos` is forced to keep the window hidden.
+3. A low-level keyboard hook watches for a Windows-key tap with no other key in the chord, and for Ctrl+Esc. That sets a reveal flag. The hook lives on its own thread so the show/hide work cannot trip Windows' low-level hook timeout.
+4. On a reveal, the bar is shown without activating it. It stays shown while the Windows key is down, while the foreground or hovered window belongs to Start or Search, or while the pointer is over the taskbar or a menu it owns. After that it is hidden again.
+5. Disabling the mod releases the hooks' hold, shows the taskbar, and writes the original work area back.
 
 ## Disclaimer
 
