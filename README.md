@@ -12,7 +12,7 @@ This mod takes the hover path away entirely. It hooks the shell calls that show 
 
 - **Always on** — the taskbar is hidden no matter which application is in front. There is no process list and no focus check.
 - **No hover reveal** — moving the pointer to the screen edge does not show the taskbar and does not steal focus.
-- **Windows key shows it** — a Windows-key tap (or Ctrl+Esc) shows the taskbar and opens Start, the same as usual. It stays up while Start or Search is open and while the pointer is over the bar, then hides again.
+- **Windows key shows it** — the taskbar appears as soon as the Windows key goes down (or on Ctrl+Esc) and stays up for the whole time Start or Search is open. It hides again shortly after Start closes.
 - **Shortcut chords stay quiet** — Win+E, Win+Tab, and other Windows-key chords do not pop the bar up.
 - **Full primary screen** — while the bar is hidden, the primary monitor's work area fills the screen. Turning the mod off puts the work area back.
 - **Reversible** — the settings switch, or disabling the mod, restores the taskbar.

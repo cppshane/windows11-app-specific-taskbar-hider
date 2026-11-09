@@ -2,7 +2,8 @@
 // @id              windows11-app-specific-taskbar-hider
 // @name            Windows 11 Keyboard-Only Taskbar Hider
 // @description     Always hides the taskbar and blocks mouse hover/edge reveal. Press the Windows key to show it.
-// @version         2.0
+// @version         2.1
+// @compilerOptions -ldwmapi
 // @author          KWWDCoding
 // @github          https://github.com/kwwdcoding/windows11-app-specific-taskbar-hider
 // @homepage        https://www.kwwd.co.uk
@@ -19,9 +20,9 @@ blocks Windows' hover/edge auto-reveal. Moving the pointer to the screen edge
 does nothing. The taskbar is shown only when you press the Windows key (or
 Ctrl+Esc, the same Start shortcut).
 
-The bar stays up while Start or Search is open, while the Windows key is held,
-and while the pointer is over the taskbar (so you can click pinned apps). It
-hides again shortly after you leave it.
+The bar is shown as soon as the Windows key goes down, and it stays up for the
+whole time Start or Search is open (and while the pointer is over the bar).
+It hides again shortly after Start closes.
 
 ## How it works
 
@@ -31,8 +32,8 @@ The shell brings the taskbar back by calling `ShowWindow`, `SetWindowPos`, and
 Windows key. The window is never allowed to appear for a hover, so the edge
 of the screen cannot pop it up or steal focus.
 
-Pressing the Windows key on its own (a tap, not Win+another key) shows the
-taskbar again without activating it, so Start keeps focus. The primary monitor's
+Pressing the Windows key shows the taskbar immediately, before Start opens, and
+keeps it on screen until Start closes. The primary monitor's
 work area is expanded to the full screen while the mod is hiding the bar, and
 restored when the mod is turned off.
 
@@ -42,10 +43,10 @@ restored when the mod is turned off.
    the bar itself. Leaving the Windows setting on makes the two fight, and a
    thin auto-hide sliver can flash at the edge.
 2. Enable the mod. The taskbar hides for every app. There is no process list.
-3. Press the Windows key to show the taskbar and open Start. Ctrl+Esc does the
-   same thing. Win+E, Win+Tab, and other chords do not show it.
-4. Click a taskbar button, or dismiss Start. Once Start/Search is gone and the
-   pointer is no longer on the taskbar, it hides again.
+3. Press the Windows key. The taskbar appears with Start and stays visible
+   while Start is open. Ctrl+Esc does the same thing.
+4. Press the Windows key again, or click away, to close Start. The taskbar
+   hides shortly after Start is gone, unless the pointer is still on it.
 
 The master switch in settings turns this off without uninstalling the mod.
 */
@@ -63,13 +64,19 @@ The master switch in settings turns this off without uninstalling the mod.
 // ==/WindhawkModSettings==
 
 #include <windows.h>
+#include <dwmapi.h>
+#include <tlhelp32.h>
 #include <windhawk_utils.h>
 
 #include <atomic>
 
-// How long the bar stays up after a Windows-key tap so Start has time to take
-// focus, and how long it lingers after the last real reason to stay up.
-constexpr ULONGLONG kRevealGraceMs = 600;
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
+
+// How long to keep the bar up while waiting for Start to actually open, and
+// how long it lingers after Start has closed.
+constexpr ULONGLONG kStartOpenGraceMs = 1500;
 constexpr ULONGLONG kLingerMs = 400;
 
 std::atomic<bool> g_masterEnabled{false};
@@ -83,8 +90,16 @@ std::atomic<bool> g_keyboardHookInstalled{false};
 
 // Written on the worker thread only.
 bool g_inUpdate = false;
+bool g_sawLauncher = false;
 ULONGLONG g_revealTick = 0;
 ULONGLONG g_lastInteractionTick = 0;
+
+struct TaskbarPlacement {
+    HWND hwnd;
+    RECT rc;
+};
+TaskbarPlacement g_placement[16];
+int g_placementCount = 0;
 bool g_savedWorkArea = false;
 bool g_workAreaExpanded = false;
 RECT g_originalWorkArea{};
@@ -282,41 +297,194 @@ bool IsLauncherWindow(HWND hwnd) {
     return IsLauncherProcess(pid);
 }
 
+bool RectIsOnScreen(const RECT& rc) {
+    RECT inter{};
+    HMONITOR monitor = MonitorFromRect(&rc, MONITOR_DEFAULTTONULL);
+    if (!monitor) return false;
+    MONITORINFO mi = {sizeof(mi)};
+    if (!GetMonitorInfo(monitor, &mi)) return false;
+    if (!IntersectRect(&inter, &rc, &mi.rcMonitor)) return false;
+    return (inter.right - inter.left) >= 40 && (inter.bottom - inter.top) >= 16;
+}
+
+bool IsShownSurface(HWND hwnd) {
+    if (!IsWindow(hwnd)) return false;
+
+    DWORD cloaked = 0;
+    HRESULT hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (SUCCEEDED(hr)) {
+        if (cloaked) return false;
+    } else if (!IsWindowVisible(hwnd)) {
+        return false;
+    }
+
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return false;
+    return RectIsOnScreen(rc);
+}
+
+bool IsLauncherSurfaceClass(HWND hwnd) {
+    return ClassIs(hwnd, L"Windows.UI.Core.CoreWindow") ||
+           ClassIs(hwnd, L"Windows.UI.Composition.DesktopWindowContentBridge") ||
+           ClassIs(hwnd, L"XamlExplorerHostIslandWindow");
+}
+
+struct LauncherEnumCtx {
+    DWORD startPid;
+    DWORD searchPid;
+    bool found;
+};
+
+BOOL CALLBACK EnumLauncherWindow(HWND hwnd, LPARAM param) {
+    auto* ctx = reinterpret_cast<LauncherEnumCtx*>(param);
+    if (ctx->found) return FALSE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->startPid && pid != ctx->searchPid) return TRUE;
+    if (!IsLauncherSurfaceClass(hwnd) || !IsShownSurface(hwnd)) return TRUE;
+
+    ctx->found = true;
+    return FALSE;
+}
+
+void FindLauncherPids(DWORD* startPid, DWORD* searchPid) {
+    *startPid = 0;
+    *searchPid = 0;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W entry = {sizeof(entry)};
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (!*startPid && _wcsicmp(entry.szExeFile, L"StartMenuExperienceHost.exe") == 0) {
+                *startPid = entry.th32ProcessID;
+            } else if (!*searchPid && _wcsicmp(entry.szExeFile, L"SearchHost.exe") == 0) {
+                *searchPid = entry.th32ProcessID;
+            }
+        } while (Process32NextW(snapshot, &entry) && (!*startPid || !*searchPid));
+    }
+    CloseHandle(snapshot);
+}
+
+// Start's window is often not the foreground window, and IsWindowVisible stays
+// true after it closes. An uncloaked, on-screen surface is the open menu.
+bool IsLauncherActive() {
+    if (IsLauncherWindow(GetForegroundWindow())) return true;
+
+    POINT pt{};
+    if (GetCursorPos(&pt)) {
+        if (IsLauncherWindow(WindowFromPoint(pt))) return true;
+    }
+
+    const wchar_t* titles[] = {L"Start", L"Search"};
+    for (const wchar_t* title : titles) {
+        HWND hwnd = FindWindowW(L"Windows.UI.Core.CoreWindow", title);
+        if (IsShownSurface(hwnd)) return true;
+    }
+
+    DWORD startPid = 0;
+    DWORD searchPid = 0;
+    FindLauncherPids(&startPid, &searchPid);
+    if (!startPid && !searchPid) return false;
+
+    LauncherEnumCtx ctx{startPid, searchPid, false};
+    EnumWindows(EnumLauncherWindow, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
 bool IsWinPhysicallyDown() {
     if (g_winDownCount.load(std::memory_order_acquire) > 0) return true;
     if (g_keyboardHookInstalled.load(std::memory_order_acquire)) return false;
     return (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
 }
 
+bool IsPointerOverTaskbar() {
+    if (IsTaskbarRelated(GetForegroundWindow())) return true;
+    POINT pt{};
+    if (!GetCursorPos(&pt)) return false;
+    return IsTaskbarRelated(WindowFromPoint(pt));
+}
+
 bool ShouldKeepRevealed() {
     ULONGLONG now = GetTickCount64();
-
-    bool hardReason = IsWinPhysicallyDown();
-    if (!hardReason) hardReason = IsLauncherWindow(GetForegroundWindow());
-
-    if (!hardReason) {
-        POINT pt;
-        if (GetCursorPos(&pt)) {
-            HWND under = WindowFromPoint(pt);
-            hardReason = IsTaskbarRelated(under) || IsLauncherWindow(under);
-        }
-    }
-
-    if (!hardReason) hardReason = IsTaskbarRelated(GetForegroundWindow());
-
-    if (hardReason) {
+    bool launcher = IsLauncherActive();
+    if (launcher) {
+        if (!g_sawLauncher) Wh_Log(L"Start menu is open, holding taskbar");
+        g_sawLauncher = true;
         g_lastInteractionTick = now;
         return true;
     }
-    if (now - g_revealTick < kRevealGraceMs) return true;
-    if (now - g_lastInteractionTick < kLingerMs) return true;
-    return false;
+
+    if (IsWinPhysicallyDown() || IsPointerOverTaskbar()) {
+        g_lastInteractionTick = now;
+        return true;
+    }
+
+    // Start was open and just closed (second Windows-key press). Stay up briefly.
+    if (g_sawLauncher) return now - g_lastInteractionTick < kLingerMs;
+
+    // Start has not appeared yet. Don't hide during the open animation.
+    return now - g_revealTick < kStartOpenGraceMs;
 }
 
 // ---------------------------------------------------------------------
 // Apply visibility. Flags are updated by the caller before this runs, so
 // nested shell calls made from inside ShowWindow hit the hooks and obey them.
 // ---------------------------------------------------------------------
+
+void RememberPlacementIfOnScreen(HWND hwnd) {
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc) || !RectIsOnScreen(rc)) return;
+
+    for (int i = 0; i < g_placementCount; i++) {
+        if (g_placement[i].hwnd == hwnd) {
+            g_placement[i].rc = rc;
+            return;
+        }
+    }
+    if (g_placementCount < ARRAYSIZE(g_placement)) {
+        g_placement[g_placementCount].hwnd = hwnd;
+        g_placement[g_placementCount].rc = rc;
+        g_placementCount++;
+    }
+}
+
+bool LookupPlacement(HWND hwnd, RECT* out) {
+    for (int i = 0; i < g_placementCount; i++) {
+        if (g_placement[i].hwnd == hwnd) {
+            *out = g_placement[i].rc;
+            return true;
+        }
+    }
+    return false;
+}
+
+void RestorePlacement(HWND hwnd) {
+    RECT want{};
+    if (!LookupPlacement(hwnd, &want)) {
+        // No saved on-screen rect yet. Dock a normal-height bar to the bottom.
+        HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = {sizeof(mi)};
+        if (!GetMonitorInfo(monitor, &mi)) return;
+        int height = 48;
+        want.left = mi.rcMonitor.left;
+        want.right = mi.rcMonitor.right;
+        want.bottom = mi.rcMonitor.bottom;
+        want.top = want.bottom - height;
+    }
+
+    int width = want.right - want.left;
+    int height = want.bottom - want.top;
+    if (width < 40 || height < 16) return;
+
+    // Bypass the hook so this snap is not treated as a shell slide.
+    if (g_origSetWindowPos) {
+        g_origSetWindowPos(hwnd, nullptr, want.left, want.top, width, height,
+                           SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
+}
 
 int SetTaskbarsHidden(bool hide, bool activateOnShow) {
     HWND bars[16];
@@ -325,6 +493,7 @@ int SetTaskbarsHidden(bool hide, bool activateOnShow) {
 
     for (int i = 0; i < count; i++) {
         if (!IsWindow(bars[i])) continue;
+        if (hide) RememberPlacementIfOnScreen(bars[i]);
         bool visible = IsWindowVisible(bars[i]) != FALSE;
         if (hide) {
             if (visible) ShowWindow(bars[i], SW_HIDE);
@@ -333,6 +502,27 @@ int SetTaskbarsHidden(bool hide, bool activateOnShow) {
         }
     }
     return count;
+}
+
+// ShowWindow alone is not enough. While Start is open the shell (sometimes
+// from another process, which our hooks never see) slides the bar off-screen.
+// Put it back on the rect it had before we hid it.
+void EnsureTaskbarsVisible() {
+    HWND bars[16];
+    int count = CollectTaskbars(bars, ARRAYSIZE(bars));
+    for (int i = 0; i < count; i++) {
+        HWND hwnd = bars[i];
+        if (!IsWindow(hwnd)) continue;
+
+        RECT current{};
+        bool haveRect = GetWindowRect(hwnd, &current) != FALSE;
+        bool onScreen = haveRect && RectIsOnScreen(current) && IsWindowVisible(hwnd);
+        if (onScreen) {
+            RememberPlacementIfOnScreen(hwnd);
+            continue;
+        }
+        RestorePlacement(hwnd);
+    }
 }
 
 void UpdateTaskbarState() {
@@ -354,6 +544,7 @@ void UpdateTaskbarState() {
             Wh_Log(L"Mod inactive, restoring taskbar");
         }
         g_loggedAsHidden = false;
+        g_sawLauncher = false;
         SetTaskbarsHidden(false, true);
         RestoreWorkArea();
         g_inUpdate = false;
@@ -377,16 +568,23 @@ void UpdateTaskbarState() {
         g_revealedByKeyboard.store(true, std::memory_order_release);
         if (g_loggedAsHidden) Wh_Log(L"Showing taskbar for Windows key");
         g_loggedAsHidden = false;
-        int count = SetTaskbarsHidden(false, false);
+        HWND bars[16];
+        int count = CollectTaskbars(bars, ARRAYSIZE(bars));
         if (count > 0) {
-            ForceFullWorkArea();
-            // A work-area change can make the shell hide the bar again.
-            SetTaskbarsHidden(false, false);
+            if (!g_workAreaExpanded) ForceFullWorkArea();
+            EnsureTaskbarsVisible();
         }
         g_inUpdate = false;
         return;
     }
 
+    if (g_revealRequested.load(std::memory_order_acquire) || IsWinPhysicallyDown()) {
+        // A Windows-key press landed while this pass was deciding to hide.
+        g_inUpdate = false;
+        return;
+    }
+
+    g_sawLauncher = false;
     g_revealedByKeyboard.store(false, std::memory_order_release);
     g_forceHidden.store(true, std::memory_order_release);
     // Sample the inset BEFORE SW_HIDE. Hiding the bar makes Explorer drop
@@ -437,6 +635,18 @@ BOOL WINAPI Hook_SetWindowPos(HWND hwnd, HWND insertAfter, int x, int y,
     if (IsTaskbarFrame(hwnd)) {
         if (g_revealedByKeyboard.load(std::memory_order_acquire)) {
             flags &= ~SWP_HIDEWINDOW;
+
+            RECT current{};
+            if (GetWindowRect(hwnd, &current)) {
+                int nx = (flags & SWP_NOMOVE) ? current.left : x;
+                int ny = (flags & SWP_NOMOVE) ? current.top : y;
+                int nw = (flags & SWP_NOSIZE) ? (current.right - current.left) : cx;
+                int nh = (flags & SWP_NOSIZE) ? (current.bottom - current.top) : cy;
+                RECT dest{nx, ny, nx + nw, ny + nh};
+                // The shell slides the bar off the edge when Start opens. Refuse
+                // that move so the Windows-key show stays on screen.
+                if (!RectIsOnScreen(dest)) flags |= SWP_NOMOVE | SWP_NOSIZE;
+            }
         } else if (g_forceHidden.load(std::memory_order_acquire)) {
             // Keep the bar hidden without letting a hover slide it off-screen,
             // or the next Windows-key show would come back in the wrong place.
@@ -486,11 +696,16 @@ bool InstallHooks() {
 // ---------------------------------------------------------------------
 // Keyboard hook. Runs on its own thread so a slow show/hide cannot trip
 // the system-wide low-level hook timeout and freeze the keyboard.
-// A plain Windows-key tap (key up with no chord) requests a reveal.
-// Win+E and other chords do not.
+// The Windows key must arm the reveal on key-down, before the event reaches
+// the shell. Waiting for key-up lets Start open while shows are still blocked,
+// which is why the bar stayed hidden until Start began to close.
 // ---------------------------------------------------------------------
 
-void RequestReveal() {
+void ArmReveal() {
+    // Publish "shown" before the shell handles this key, so its own unhide
+    // is allowed and its hide is rejected.
+    g_forceHidden.store(false, std::memory_order_release);
+    g_revealedByKeyboard.store(true, std::memory_order_release);
     g_revealRequested.store(true, std::memory_order_release);
     if (g_wakeEvent) SetEvent(g_wakeEvent);
 }
@@ -503,6 +718,7 @@ void NoteWinKey(bool left, bool down) {
         if (!g_lwinDown && !g_rwinDown) g_winChord = false;
         flag = true;
         g_winDownCount.fetch_add(1, std::memory_order_release);
+        ArmReveal();
         return;
     }
 
@@ -512,7 +728,7 @@ void NoteWinKey(bool left, bool down) {
         g_winDownCount.store(0, std::memory_order_release);
         remaining = 0;
     }
-    if (remaining == 0 && !g_winChord) RequestReveal();
+    if (remaining == 0 && !g_winChord) ArmReveal();
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
@@ -525,7 +741,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (vk == VK_LWIN || vk == VK_RWIN) {
             NoteWinKey(vk == VK_LWIN, !up);
         } else if (!up && vk == VK_ESCAPE && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
-            RequestReveal();
+            ArmReveal();
         } else if (!up && (g_lwinDown || g_rwinDown)) {
             g_winChord = true;
         }
@@ -538,11 +754,12 @@ void PollFallbackWinKey() {
     if (g_keyboardHookInstalled.load(std::memory_order_acquire)) return;
 
     bool down = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-    if (g_fallbackWinDown && !down) RequestReveal();
+    if (down && !g_fallbackWinDown) ArmReveal();
+    else if (g_fallbackWinDown && !down) ArmReveal();
     g_fallbackWinDown = down;
 
     bool ctrlEsc = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
-    if (ctrlEsc && !g_fallbackCtrlEsc) RequestReveal();
+    if (ctrlEsc && !g_fallbackCtrlEsc) ArmReveal();
     g_fallbackCtrlEsc = ctrlEsc;
 }
 
