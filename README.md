@@ -6,7 +6,7 @@ A [Windhawk](https://windhawk.net) mod that hides the Windows 11 taskbar for eve
 
 Windows' "Automatically hide the taskbar" option still slides the bar back in (and steals focus) the moment the pointer reaches the screen edge. That gets in the way of anything that lives along that edge: a timeline scrollbar, a horizontal scrollbar, a status bar.
 
-This mod takes the hover path away entirely. It hooks the shell calls that show and focus the taskbar (`ShowWindow`, `ShowWindowAsync`, `SetWindowPos`, `SetForegroundWindow`) and drops them unless you asked for the bar with the keyboard. The previous version did that only while chosen apps were running. It now stays on for every app.
+This mod takes the hover path away entirely. On Windows 11 the taskbar you see is an expanded shell view, not just a shown window, so the mod blocks the mouse unhide and lets the Windows key run the shell's own unhide. That is the path that stays up for the whole time Start is open. The previous version did this only while chosen apps were running. It now stays on for every app.
 
 ## Features
 
@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/08ac4170-572b-4d19-84e9-2347bd0806f4
 
 ## Usage notes
 
-- Leave Windows' own **Automatically hide the taskbar** setting **off**. This mod hides the bar itself. With the Windows setting on, the shell keeps trying to slide a sliver in from the edge and the two controllers fight.
+- Leave Windows' own **Automatically hide the taskbar** setting **off**. While this mod is enabled it turns that shell behavior on itself, and it writes the previous state back when you disable the mod. The collapsed bar is cloaked, so the thin auto-hide line does not show.
 - Press the **Windows key** by itself to show the taskbar and open Start. **Ctrl+Esc** does the same thing. The bar hides again shortly after Start/Search closes and the pointer leaves the taskbar.
 - Win combined with another key (Win+E, Win+1, Win+Tab, and so on) does not show the taskbar.
 - Secondary taskbars are hidden too. The full-screen work area is applied to the primary monitor, which is the only monitor `SPI_SETWORKAREA` can change.
@@ -47,18 +47,18 @@ https://github.com/user-attachments/assets/08ac4170-572b-4d19-84e9-2347bd0806f4
 
 - The bar can take a fraction of a second to hide again after you dismiss Start or move the pointer off it.
 - Notification toasts and other shell popups do not pull the taskbar out. The Windows key is the way to show it.
-- If Start or Search never becomes the foreground window, the bar still hides again after a short grace period. Press the Windows key once more to bring it back.
-- Hooking `ShowWindow` and `SetWindowPos` for the whole of `explorer.exe` can, in principle, interact with another shell feature that shows the taskbar for its own reasons. Disable the mod to restore stock behavior.
+- If Start never produces a visible window the mod can see, the bar still hides again after a short grace period. Press the Windows key once more to bring it back.
+- The mod turns shell auto-hide on while it is loaded. Disabling it, or unloading it, writes the previous taskbar state back.
 
 ## How it works (technical)
 
 The mod runs inside `explorer.exe` and:
 
-1. Hides every `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` and expands the primary work area to the full monitor.
-2. Hooks `ShowWindow`, `ShowWindowAsync`, `SetWindowPos`, and `SetForegroundWindow`. While the bar is supposed to be hidden, show and activate calls aimed at a taskbar window are dropped, and `SetWindowPos` is forced to keep the window hidden.
-3. A low-level keyboard hook watches for a Windows-key tap with no other key in the chord, and for Ctrl+Esc. That sets a reveal flag. The hook lives on its own thread so the show/hide work cannot trip Windows' low-level hook timeout.
-4. On a reveal, the bar is shown without activating it. It stays shown while the Windows key is down, while the foreground or hovered window belongs to Start or Search, or while the pointer is over the taskbar or a menu it owns. After that it is hidden again.
-5. Disabling the mod releases the hooks' hold, shows the taskbar, and writes the original work area back.
+1. Turns on the shell's auto-hide state (restored on unload), expands the primary work area to the full monitor, and cloaks the collapsed taskbar so no sliver remains. It does not `SW_HIDE` the tray window. On Windows 11 that leaves the XAML taskbar collapsed, so it stays invisible while Start is open and only flashes as Start closes.
+2. Blocks the mouse unhide only: tray timer id 3, and the Win11 view reasons for pointer-over and screen-edge. While a keyboard reveal is active, `ShouldTaskbarBeExpanded` stays true and the hide timer is swallowed, so the bar cannot collapse out from under Start.
+3. A low-level keyboard hook watches for a Windows-key tap with no other key in the chord, and for Ctrl+Esc. On key-down, before the event reaches the shell, it marks the bar shown and removes the cloak. The hook lives on its own thread so the show/hide work cannot trip Windows' low-level hook timeout.
+4. The shell then runs its real unhide. The bar stays up while the Windows key is down, while Start or Search has a visible window, or while the pointer is over the taskbar. After Start closes it is collapsed and cloaked again.
+5. Disabling the mod uncloaks the taskbar, restores the previous auto-hide state, shows the taskbar, and writes the original work area back.
 
 ## Disclaimer
 

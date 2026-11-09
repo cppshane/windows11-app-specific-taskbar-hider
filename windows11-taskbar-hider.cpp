@@ -2,8 +2,8 @@
 // @id              windows11-app-specific-taskbar-hider
 // @name            Windows 11 Keyboard-Only Taskbar Hider
 // @description     Always hides the taskbar and blocks mouse hover/edge reveal. Press the Windows key to show it.
-// @version         2.1
-// @compilerOptions -ldwmapi
+// @version         2.2
+// @compilerOptions -ldwmapi -lshell32
 // @author          KWWDCoding
 // @github          https://github.com/kwwdcoding/windows11-app-specific-taskbar-hider
 // @homepage        https://www.kwwd.co.uk
@@ -21,27 +21,31 @@ does nothing. The taskbar is shown only when you press the Windows key (or
 Ctrl+Esc, the same Start shortcut).
 
 The bar is shown as soon as the Windows key goes down, and it stays up for the
-whole time Start or Search is open (and while the pointer is over the bar).
-It hides again shortly after Start closes.
+whole time Start or Search is open (and while the pointer is still over the
+bar). It hides again shortly after Start closes.
 
 ## How it works
 
-The shell brings the taskbar back by calling `ShowWindow`, `SetWindowPos`, and
-`SetForegroundWindow` on `Shell_TrayWnd`. This mod hooks those calls inside
-`explorer.exe` and rejects every show attempt that did not come from the
-Windows key. The window is never allowed to appear for a hover, so the edge
-of the screen cannot pop it up or steal focus.
+On Windows 11 the pictures on the taskbar come from the shell's expand/collapse
+state. Hiding `Shell_TrayWnd` with `ShowWindow` leaves that state collapsed, so
+the bar stays invisible the whole time Start is open and only flashes when
+Start closes. This mod does not do that.
 
-Pressing the Windows key shows the taskbar immediately, before Start opens, and
-keeps it on screen until Start closes. The primary monitor's
-work area is expanded to the full screen while the mod is hiding the bar, and
-restored when the mod is turned off.
+While the mod is on it turns on the shell's own auto-hide (and puts the
+previous setting back when the mod unloads), then blocks only the mouse unhide
+path: the tray unhide timer, and the Win11 pointer-over / screen-edge expand.
+The Windows key is left alone, so the shell runs its real unhide, the same one
+that stays up for the whole time Start is open. The collapsed bar is cloaked so
+the thin auto-hide sliver does not show.
+
+The primary monitor's work area is expanded to the full screen while the mod
+is hiding the bar, and restored when the mod is turned off.
 
 ## Usage
 
-1. Leave Windows' own "Automatically hide the taskbar" **off**. This mod hides
-   the bar itself. Leaving the Windows setting on makes the two fight, and a
-   thin auto-hide sliver can flash at the edge.
+1. Leave Windows' own "Automatically hide the taskbar" **off**. The mod turns
+   that behavior on while it is loaded and writes the previous state back when
+   it unloads or you disable the switch.
 2. Enable the mod. The taskbar hides for every app. There is no process list.
 3. Press the Windows key. The taskbar appears with Start and stays visible
    while Start is open. Ctrl+Esc does the same thing.
@@ -65,14 +69,25 @@ The master switch in settings turns this off without uninstalling the mod.
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <windhawk_utils.h>
 
 #include <atomic>
 
+#ifndef DWMWA_CLOAK
+#define DWMWA_CLOAK 13
+#endif
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
 #endif
+
+// TrayUI timer ids. 3 is the mouse unhide; the Windows key does not use it.
+constexpr UINT_PTR kTrayTimerHide = 2;
+constexpr UINT_PTR kTrayTimerUnhide = 3;
+// ViewCoordinator::UpdateIsExpanded reasons that mean "the pointer did this".
+constexpr int kReasonPointerOver = 7;
+constexpr int kReasonEdgeStroke = 8;
 
 // How long to keep the bar up while waiting for Start to actually open, and
 // how long it lingers after Start has closed.
@@ -126,6 +141,54 @@ SetWindowPos_t g_origSetWindowPos = nullptr;
 
 using SetForegroundWindow_t = BOOL(WINAPI*)(HWND);
 SetForegroundWindow_t g_origSetForegroundWindow = nullptr;
+
+using SetTimer_t = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC);
+SetTimer_t g_origSetTimer = nullptr;
+
+using DwmSetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+DwmSetWindowAttribute_t g_origDwmSetWindowAttribute = nullptr;
+
+using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+LoadLibraryExW_t g_origLoadLibraryExW = nullptr;
+
+// ViewCoordinator lives in Taskbar.View.dll / ExplorerExtensions.dll.
+// Calling the originals bypasses our mouse block.
+using ViewIsExpanded_t = bool(WINAPI*)(void* pThis, HWND hwnd);
+ViewIsExpanded_t g_origIsExpanded = nullptr;
+
+using ViewPointerOver_t = void(WINAPI*)(void* pThis, HWND hwnd, bool over, int device);
+ViewPointerOver_t g_origPointerOver = nullptr;
+
+using ViewShouldExpand_t = bool(WINAPI*)(void* pThis, HWND hwnd, bool expanded);
+ViewShouldExpand_t g_origShouldExpand = nullptr;
+
+using ViewUpdateExpanded_t = void(WINAPI*)(void* pThis, HWND hwnd, int reason);
+ViewUpdateExpanded_t g_origUpdateExpanded = nullptr;
+
+// Set on the keyboard hook before the shell sees the Windows key, and held
+// by the worker until Start has closed. View hooks read it.
+std::atomic<bool> g_suppressReveal{false};
+std::atomic<bool> g_controlExpand{false};
+std::atomic<bool> g_afterInit{false};
+
+// "this" captured from the view hooks. Touched under g_coordLock.
+struct CoordinatorSlot {
+    HWND hwnd;
+    void* pThis;
+};
+CoordinatorSlot g_coordinators[8];
+int g_coordinatorCount = 0;
+CRITICAL_SECTION g_coordLock;
+bool g_coordLockReady = false;
+
+bool g_autoHideSaved = false;
+UINT g_originalAppBarState = 0;
+bool g_viewHooksReady = false;
+HMODULE g_viewFailedModule = nullptr;
+
+// Nonzero while this mod is inside the shell expand/collapse call. A mouse
+// unhide that arrives on its own is blocked; one we requested is not.
+std::atomic<int> g_shellDriveDepth{0};
 
 // ---------------------------------------------------------------------
 // Taskbar windows
@@ -335,6 +398,15 @@ struct LauncherEnumCtx {
     bool found;
 };
 
+bool IsLargeOnScreen(HWND hwnd) {
+    if (!IsShownSurface(hwnd)) return false;
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return false;
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    return width >= 160 && height >= 160;
+}
+
 BOOL CALLBACK EnumLauncherWindow(HWND hwnd, LPARAM param) {
     auto* ctx = reinterpret_cast<LauncherEnumCtx*>(param);
     if (ctx->found) return FALSE;
@@ -342,7 +414,16 @@ BOOL CALLBACK EnumLauncherWindow(HWND hwnd, LPARAM param) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid != ctx->startPid && pid != ctx->searchPid) return TRUE;
-    if (!IsLauncherSurfaceClass(hwnd) || !IsShownSurface(hwnd)) return TRUE;
+
+    // Search keeps the class filter. Start also counts any large uncloaked
+    // window, because newer builds do not use CoreWindow for it.
+    if (pid == ctx->startPid) {
+        bool matched = (IsLauncherSurfaceClass(hwnd) && IsShownSurface(hwnd)) ||
+                       IsLargeOnScreen(hwnd);
+        if (!matched) return TRUE;
+    } else if (!(IsLauncherSurfaceClass(hwnd) && IsShownSurface(hwnd))) {
+        return TRUE;
+    }
 
     ctx->found = true;
     return FALSE;
@@ -416,6 +497,10 @@ bool ShouldKeepRevealed() {
         g_lastInteractionTick = now;
         return true;
     }
+
+    // Win+E and the other chords arm a reveal on the Windows key going down.
+    // Drop it once another key makes it a chord, unless Start really opened.
+    if (g_suppressReveal.load(std::memory_order_acquire)) return false;
 
     if (IsWinPhysicallyDown() || IsPointerOverTaskbar()) {
         g_lastInteractionTick = now;
@@ -504,25 +589,152 @@ int SetTaskbarsHidden(bool hide, bool activateOnShow) {
     return count;
 }
 
-// ShowWindow alone is not enough. While Start is open the shell (sometimes
-// from another process, which our hooks never see) slides the bar off-screen.
-// Put it back on the rect it had before we hid it.
-void EnsureTaskbarsVisible() {
+void CloakWindowRaw(HWND hwnd, BOOL cloak) {
+    if (!IsWindow(hwnd)) return;
+    if (g_origDwmSetWindowAttribute) {
+        g_origDwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    } else {
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    }
+}
+
+bool IsCloaked(HWND hwnd) {
+    DWORD cloaked = 0;
+    HRESULT hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    return SUCCEEDED(hr) && cloaked != 0;
+}
+
+void RememberCoordinator(HWND hwnd, void* pThis) {
+    if (!hwnd || !pThis || !g_coordLockReady) return;
+    EnterCriticalSection(&g_coordLock);
+    for (int i = 0; i < g_coordinatorCount; i++) {
+        if (g_coordinators[i].hwnd == hwnd) {
+            g_coordinators[i].pThis = pThis;
+            LeaveCriticalSection(&g_coordLock);
+            return;
+        }
+    }
+    if (g_coordinatorCount < ARRAYSIZE(g_coordinators)) {
+        g_coordinators[g_coordinatorCount].hwnd = hwnd;
+        g_coordinators[g_coordinatorCount].pThis = pThis;
+        g_coordinatorCount++;
+    }
+    LeaveCriticalSection(&g_coordLock);
+}
+
+void CopyCoordinators(CoordinatorSlot* out, int* count) {
+    *count = 0;
+    if (!g_coordLockReady) return;
+    EnterCriticalSection(&g_coordLock);
+    *count = g_coordinatorCount;
+    for (int i = 0; i < g_coordinatorCount; i++) out[i] = g_coordinators[i];
+    LeaveCriticalSection(&g_coordLock);
+}
+
+// Ask the shell to expand or collapse the real taskbar. ShowWindow on
+// Shell_TrayWnd does not do this on Windows 11: the XAML bar stays collapsed
+// while Start is open, then paints for a moment as Start closes.
+void DriveTaskbar(bool expand) {
+    HWND bars[16];
+    int count = CollectTaskbars(bars, ARRAYSIZE(bars));
+
+    if (expand) {
+        for (int i = 0; i < count; i++) {
+            HWND hwnd = bars[i];
+            if (!IsWindow(hwnd)) continue;
+            if (!IsWindowVisible(hwnd) && g_origShowWindow) {
+                g_origShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            RECT current{};
+            bool onScreen = GetWindowRect(hwnd, &current) && RectIsOnScreen(current) &&
+                            IsWindowVisible(hwnd);
+            if (!onScreen) RestorePlacement(hwnd);
+            CloakWindowRaw(hwnd, FALSE);
+            if (g_origSetTimer) g_origSetTimer(hwnd, kTrayTimerUnhide, 0, nullptr);
+        }
+    }
+
+    // A Windows key can land while a collapse is already running. Collapsing
+    // after that key is what left the bar invisible for the whole time Start
+    // was open.
+    if (!expand && g_revealedByKeyboard.load(std::memory_order_acquire)) return;
+
+    CoordinatorSlot slots[8];
+    int slotCount = 0;
+    CopyCoordinators(slots, &slotCount);
+    if (g_origPointerOver && slotCount > 0) {
+        g_shellDriveDepth.fetch_add(1, std::memory_order_acq_rel);
+        for (int i = 0; i < slotCount; i++) {
+            if (!IsWindow(slots[i].hwnd)) continue;
+            if (!expand && g_revealedByKeyboard.load(std::memory_order_acquire)) {
+                g_shellDriveDepth.fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
+            if (expand) CloakWindowRaw(slots[i].hwnd, FALSE);
+            g_origPointerOver(slots[i].pThis, slots[i].hwnd, expand, 0);
+        }
+        g_shellDriveDepth.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    if (!expand) {
+        if (g_revealedByKeyboard.load(std::memory_order_acquire)) return;
+        for (int i = 0; i < count; i++) {
+            if (!IsWindow(bars[i])) continue;
+            if (g_origSetTimer) g_origSetTimer(bars[i], kTrayTimerHide, 0, nullptr);
+            CloakWindowRaw(bars[i], TRUE);
+        }
+        for (int i = 0; i < slotCount; i++) {
+            if (IsWindow(slots[i].hwnd)) CloakWindowRaw(slots[i].hwnd, TRUE);
+        }
+    }
+}
+
+bool TaskbarNeedsExpand() {
     HWND bars[16];
     int count = CollectTaskbars(bars, ARRAYSIZE(bars));
     for (int i = 0; i < count; i++) {
-        HWND hwnd = bars[i];
-        if (!IsWindow(hwnd)) continue;
-
+        if (!IsWindow(bars[i])) continue;
+        if (IsCloaked(bars[i]) || !IsWindowVisible(bars[i])) return true;
         RECT current{};
-        bool haveRect = GetWindowRect(hwnd, &current) != FALSE;
-        bool onScreen = haveRect && RectIsOnScreen(current) && IsWindowVisible(hwnd);
-        if (onScreen) {
-            RememberPlacementIfOnScreen(hwnd);
-            continue;
-        }
-        RestorePlacement(hwnd);
+        if (!GetWindowRect(bars[i], &current) || !RectIsOnScreen(current)) return true;
     }
+
+    CoordinatorSlot slots[8];
+    int slotCount = 0;
+    CopyCoordinators(slots, &slotCount);
+    if (g_origIsExpanded) {
+        for (int i = 0; i < slotCount; i++) {
+            if (!IsWindow(slots[i].hwnd)) continue;
+            if (!g_origIsExpanded(slots[i].pThis, slots[i].hwnd)) return true;
+        }
+    }
+    return false;
+}
+
+void EnsureShellAutoHide() {
+    APPBARDATA abd = {sizeof(abd)};
+    abd.hWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    UINT state = (UINT)SHAppBarMessage(ABM_GETSTATE, &abd);
+    if (!g_autoHideSaved) {
+        g_originalAppBarState = state;
+        g_autoHideSaved = true;
+        Wh_Log(L"Saved taskbar state 0x%X", state);
+    }
+    if (state & ABS_AUTOHIDE) return;
+
+    abd.lParam = (LPARAM)(state | ABS_AUTOHIDE);
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    Wh_Log(L"Turned shell auto-hide on for the keyboard unhide path");
+}
+
+void RestoreShellAutoHide() {
+    if (!g_autoHideSaved) return;
+    APPBARDATA abd = {sizeof(abd)};
+    abd.hWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    abd.lParam = (LPARAM)(g_originalAppBarState & (ABS_AUTOHIDE | ABS_ALWAYSONTOP));
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    Wh_Log(L"Restored taskbar state 0x%X", (UINT)abd.lParam);
+    g_autoHideSaved = false;
 }
 
 void UpdateTaskbarState() {
@@ -538,14 +750,17 @@ void UpdateTaskbarState() {
     }
 
     if (!g_masterEnabled.load(std::memory_order_acquire)) {
+        g_controlExpand.store(false, std::memory_order_release);
         g_forceHidden.store(false, std::memory_order_release);
         g_revealedByKeyboard.store(false, std::memory_order_release);
-        if (g_loggedAsHidden || g_workAreaExpanded) {
+        if (g_loggedAsHidden || g_workAreaExpanded || g_autoHideSaved) {
             Wh_Log(L"Mod inactive, restoring taskbar");
         }
         g_loggedAsHidden = false;
         g_sawLauncher = false;
+        DriveTaskbar(true);
         SetTaskbarsHidden(false, true);
+        RestoreShellAutoHide();
         RestoreWorkArea();
         g_inUpdate = false;
         return;
@@ -561,24 +776,34 @@ void UpdateTaskbarState() {
         return;
     }
 
-    bool keep = freshReveal ||
-                (g_revealedByKeyboard.load(std::memory_order_acquire) && ShouldKeepRevealed());
+    // Sample the inset before auto-hide, which makes Explorer drop it.
+    RememberWorkAreaIfNeeded();
+    if (!g_viewHooksReady) InstallViewHooks();
+    EnsureShellAutoHide();
+    if (!g_workAreaExpanded) ForceFullWorkArea();
+    g_controlExpand.store(true, std::memory_order_release);
+
+    // A Win chord (Win+E and the rest) sets suppress after the key-down reveal.
+    // Don't keep that reveal unless Start actually opened.
+    bool chord = g_suppressReveal.load(std::memory_order_acquire) && !g_sawLauncher &&
+                 !IsLauncherActive();
+    bool keep = !chord &&
+                (freshReveal ||
+                 (g_revealedByKeyboard.load(std::memory_order_acquire) && ShouldKeepRevealed()));
     if (keep) {
+        if (freshReveal && !IsLauncherActive()) g_sawLauncher = false;
         g_forceHidden.store(false, std::memory_order_release);
         g_revealedByKeyboard.store(true, std::memory_order_release);
-        if (g_loggedAsHidden) Wh_Log(L"Showing taskbar for Windows key");
+        if (g_loggedAsHidden) Wh_Log(L"Expanding taskbar for Windows key");
         g_loggedAsHidden = false;
-        HWND bars[16];
-        int count = CollectTaskbars(bars, ARRAYSIZE(bars));
-        if (count > 0) {
-            if (!g_workAreaExpanded) ForceFullWorkArea();
-            EnsureTaskbarsVisible();
-        }
+        if (freshReveal || TaskbarNeedsExpand()) DriveTaskbar(true);
         g_inUpdate = false;
         return;
     }
 
-    if (g_revealRequested.load(std::memory_order_acquire) || IsWinPhysicallyDown()) {
+    // Win is still down on a chord (suppress is set). That must not abort the hide.
+    bool winHold = IsWinPhysicallyDown() && !g_suppressReveal.load(std::memory_order_acquire);
+    if (g_revealRequested.load(std::memory_order_acquire) || winHold) {
         // A Windows-key press landed while this pass was deciding to hide.
         g_inUpdate = false;
         return;
@@ -587,17 +812,26 @@ void UpdateTaskbarState() {
     g_sawLauncher = false;
     g_revealedByKeyboard.store(false, std::memory_order_release);
     g_forceHidden.store(true, std::memory_order_release);
-    // Sample the inset BEFORE SW_HIDE. Hiding the bar makes Explorer drop
-    // the inset, and sampling afterwards would restore a full-screen rect.
-    if (FindWindowW(L"Shell_TrayWnd", nullptr) ||
-        FindWindowW(L"Shell_SecondaryTrayWnd", nullptr)) {
-        RememberWorkAreaIfNeeded();
+    winHold = IsWinPhysicallyDown() && !g_suppressReveal.load(std::memory_order_acquire);
+    if (g_revealRequested.load(std::memory_order_acquire) || winHold) {
+        g_revealedByKeyboard.store(true, std::memory_order_release);
+        g_forceHidden.store(false, std::memory_order_release);
+        g_inUpdate = false;
+        return;
     }
-    int count = SetTaskbarsHidden(true, false);
-    if (count > 0) {
-        if (!g_loggedAsHidden) Wh_Log(L"Hiding taskbar");
+
+    // Collapse and cloak. Do not SW_HIDE the tray: that leaves the XAML bar
+    // collapsed, so the next Windows key cannot paint it until Start closes.
+    bool anyVisible = false;
+    HWND bars[16];
+    int barCount = CollectTaskbars(bars, ARRAYSIZE(bars));
+    for (int i = 0; i < barCount; i++) {
+        if (IsWindow(bars[i]) && !IsCloaked(bars[i])) anyVisible = true;
+    }
+    if (!g_loggedAsHidden || anyVisible) {
+        if (!g_loggedAsHidden) Wh_Log(L"Collapsing taskbar");
         g_loggedAsHidden = true;
-        ForceFullWorkArea();
+        DriveTaskbar(false);
     }
     g_inUpdate = false;
 }
@@ -648,10 +882,10 @@ BOOL WINAPI Hook_SetWindowPos(HWND hwnd, HWND insertAfter, int x, int y,
                 if (!RectIsOnScreen(dest)) flags |= SWP_NOMOVE | SWP_NOSIZE;
             }
         } else if (g_forceHidden.load(std::memory_order_acquire)) {
-            // Keep the bar hidden without letting a hover slide it off-screen,
-            // or the next Windows-key show would come back in the wrong place.
+            // Drop a hover show. Do not force SWP_HIDEWINDOW: hiding the HWND
+            // is what left the XAML bar collapsed for the whole time Start was open.
             flags &= ~SWP_SHOWWINDOW;
-            flags |= SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOMOVE;
+            flags |= SWP_NOACTIVATE;
         }
     }
     return g_origSetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags);
@@ -664,6 +898,153 @@ BOOL WINAPI Hook_SetForegroundWindow(HWND hwnd) {
         return FALSE;
     }
     return g_origSetForegroundWindow(hwnd);
+}
+
+UINT_PTR WINAPI Hook_SetTimer(HWND hwnd, UINT_PTR id, UINT elapse, TIMERPROC proc) {
+    // Swallow the mouse unhide timer. The Windows key unhides through
+    // TrayUI::Unhide / ViewCoordinator, not this timer.
+    bool control = g_masterEnabled.load(std::memory_order_acquire) &&
+                   g_controlExpand.load(std::memory_order_acquire);
+    bool revealed = g_revealedByKeyboard.load(std::memory_order_acquire);
+    if (IsTaskbarFrame(hwnd) && control) {
+        // Mouse unhide. The Windows key does not use this timer.
+        if (id == kTrayTimerUnhide && !revealed) return id ? id : 1;
+        // Don't let the shell's hide timer pull the bar down while Start is open.
+        if (id == kTrayTimerHide && revealed) return id ? id : 1;
+    }
+    return g_origSetTimer(hwnd, id, elapse, proc);
+}
+
+bool IsTrackedTaskbar(HWND hwnd) {
+    if (IsTaskbarFrame(hwnd)) return true;
+    if (!hwnd || !g_coordLockReady) return false;
+    bool found = false;
+    EnterCriticalSection(&g_coordLock);
+    for (int i = 0; i < g_coordinatorCount; i++) {
+        if (g_coordinators[i].hwnd == hwnd) {
+            found = true;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_coordLock);
+    return found;
+}
+
+HRESULT WINAPI Hook_DwmSetWindowAttribute(HWND hwnd, DWORD attribute, LPCVOID data, DWORD size) {
+    if (attribute == DWMWA_CLOAK && IsTrackedTaskbar(hwnd) && data && size >= sizeof(BOOL) &&
+        g_masterEnabled.load(std::memory_order_acquire) &&
+        g_controlExpand.load(std::memory_order_acquire) &&
+        !g_revealedByKeyboard.load(std::memory_order_acquire) &&
+        !*(const BOOL*)data) {
+        return S_OK;
+    }
+    return g_origDwmSetWindowAttribute(hwnd, attribute, data, size);
+}
+
+void WINAPI Hook_PointerOver(void* pThis, HWND hwnd, bool over, int device) {
+    RememberCoordinator(hwnd, pThis);
+    g_origPointerOver(pThis, hwnd, over, device);
+}
+
+bool WINAPI Hook_ShouldExpand(void* pThis, HWND hwnd, bool expanded) {
+    RememberCoordinator(hwnd, pThis);
+    if (!g_masterEnabled.load(std::memory_order_acquire) ||
+        !g_controlExpand.load(std::memory_order_acquire)) {
+        return g_origShouldExpand(pThis, hwnd, expanded);
+    }
+    // Hold the bar open for the whole keyboard reveal. Otherwise refuse, so a
+    // hover cannot expand it.
+    if (g_revealedByKeyboard.load(std::memory_order_acquire)) return true;
+    return false;
+}
+
+void WINAPI Hook_UpdateExpanded(void* pThis, HWND hwnd, int reason) {
+    RememberCoordinator(hwnd, pThis);
+    bool revealed = g_revealedByKeyboard.load(std::memory_order_acquire);
+    bool control = g_masterEnabled.load(std::memory_order_acquire) &&
+                   g_controlExpand.load(std::memory_order_acquire);
+    bool mouse = reason == kReasonPointerOver || reason == kReasonEdgeStroke;
+    bool fromMod = g_shellDriveDepth.load(std::memory_order_acquire) > 0;
+    if (control && !revealed && mouse && !fromMod) return;
+
+    if (control && revealed) CloakWindowRaw(hwnd, FALSE);
+    g_origUpdateExpanded(pThis, hwnd, reason);
+
+    if (!control || !g_origIsExpanded) return;
+    bool isExpanded = false;
+    if (g_origIsExpanded) isExpanded = g_origIsExpanded(pThis, hwnd);
+    if (isExpanded || revealed) CloakWindowRaw(hwnd, FALSE);
+    else CloakWindowRaw(hwnd, TRUE);
+}
+
+bool RegisterViewHooks(HMODULE module) {
+    if (!module || g_viewHooksReady || module == g_viewFailedModule) return g_viewHooksReady;
+
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(public: bool __cdecl winrt::Taskbar::implementation::ViewCoordinator::IsExpanded(unsigned __int64))"},
+            &g_origIsExpanded,
+            nullptr,
+            true,
+        },
+        {
+            {LR"(public: void __cdecl winrt::Taskbar::implementation::ViewCoordinator::HandleIsPointerOverTaskbarFrameChanged(unsigned __int64,bool,enum winrt::WindowsUdk::UI::Shell::InputDeviceKind))"},
+            &g_origPointerOver,
+            Hook_PointerOver,
+            true,
+        },
+        {
+            {LR"(public: bool __cdecl winrt::Taskbar::implementation::ViewCoordinator::ShouldTaskbarBeExpanded(unsigned __int64,bool))"},
+            &g_origShouldExpand,
+            Hook_ShouldExpand,
+            true,
+        },
+        {
+            {LR"(public: void __cdecl winrt::Taskbar::implementation::ViewCoordinator::UpdateIsExpanded(unsigned __int64,enum TaskbarTipTest::TaskbarExpandCollapseReason))"},
+            &g_origUpdateExpanded,
+            Hook_UpdateExpanded,
+            true,
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
+        Wh_Log(L"Taskbar view symbols were not found");
+        g_viewFailedModule = module;
+        return false;
+    }
+
+    g_viewHooksReady = g_origShouldExpand != nullptr && g_origUpdateExpanded != nullptr;
+    if (!g_viewHooksReady) {
+        Wh_Log(L"Taskbar view module has no ViewCoordinator symbols");
+        g_viewFailedModule = module;
+        return false;
+    }
+
+    Wh_Log(L"Hooked taskbar ViewCoordinator");
+    if (g_afterInit.load(std::memory_order_acquire)) Wh_ApplyHookOperations();
+    return true;
+}
+
+void InstallViewHooks() {
+    if (g_viewHooksReady) return;
+    HMODULE view = GetModuleHandleW(L"Taskbar.View.dll");
+    if (view) RegisterViewHooks(view);
+    if (g_viewHooksReady) return;
+    HMODULE ext = GetModuleHandleW(L"ExplorerExtensions.dll");
+    if (ext && ext != view) RegisterViewHooks(ext);
+}
+
+HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
+    HMODULE module = g_origLoadLibraryExW(name, file, flags);
+    if (!module || !name || g_viewHooksReady) return module;
+
+    const wchar_t* base = wcsrchr(name, L'\\');
+    base = base ? base + 1 : name;
+    if (_wcsicmp(base, L"Taskbar.View.dll") == 0 ||
+        _wcsicmp(base, L"ExplorerExtensions.dll") == 0) {
+        RegisterViewHooks(module);
+    }
+    return module;
 }
 
 bool InstallHooks() {
@@ -690,6 +1071,30 @@ bool InstallHooks() {
                             (void**)&g_origSetForegroundWindow)) {
         return false;
     }
+
+    void* setTimer = (void*)GetProcAddress(user32, "SetTimer");
+    if (setTimer &&
+        !Wh_SetFunctionHook(setTimer, (void*)Hook_SetTimer, (void**)&g_origSetTimer)) {
+        Wh_Log(L"Failed to hook SetTimer");
+    }
+
+    HMODULE dwmapi = GetModuleHandleW(L"dwmapi.dll");
+    if (!dwmapi) dwmapi = LoadLibraryW(L"dwmapi.dll");
+    void* dwmAttr = dwmapi ? (void*)GetProcAddress(dwmapi, "DwmSetWindowAttribute") : nullptr;
+    if (dwmAttr &&
+        !Wh_SetFunctionHook(dwmAttr, (void*)Hook_DwmSetWindowAttribute,
+                            (void**)&g_origDwmSetWindowAttribute)) {
+        Wh_Log(L"Failed to hook DwmSetWindowAttribute");
+    }
+
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    void* loadLib = kernelBase ? (void*)GetProcAddress(kernelBase, "LoadLibraryExW") : nullptr;
+    if (loadLib &&
+        !Wh_SetFunctionHook(loadLib, (void*)Hook_LoadLibraryExW, (void**)&g_origLoadLibraryExW)) {
+        Wh_Log(L"Failed to hook LoadLibraryExW");
+    }
+
+    InstallViewHooks();
     return true;
 }
 
@@ -701,12 +1106,22 @@ bool InstallHooks() {
 // which is why the bar stayed hidden until Start began to close.
 // ---------------------------------------------------------------------
 
+void UncloakTaskbarsNow() {
+    // The shell paints the unhide as soon as it sees this key. Drop the cloak
+    // first, or that paint happens on an invisible window.
+    HWND bars[16];
+    int count = CollectTaskbars(bars, ARRAYSIZE(bars));
+    for (int i = 0; i < count; i++) CloakWindowRaw(bars[i], FALSE);
+}
+
 void ArmReveal() {
     // Publish "shown" before the shell handles this key, so its own unhide
-    // is allowed and its hide is rejected.
+    // is allowed and a hover block cannot swallow it.
+    g_suppressReveal.store(false, std::memory_order_release);
     g_forceHidden.store(false, std::memory_order_release);
     g_revealedByKeyboard.store(true, std::memory_order_release);
     g_revealRequested.store(true, std::memory_order_release);
+    UncloakTaskbarsNow();
     if (g_wakeEvent) SetEvent(g_wakeEvent);
 }
 
@@ -744,6 +1159,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
             ArmReveal();
         } else if (!up && (g_lwinDown || g_rwinDown)) {
             g_winChord = true;
+            g_suppressReveal.store(true, std::memory_order_release);
+            if (g_wakeEvent) SetEvent(g_wakeEvent);
         }
     }
     return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
@@ -827,32 +1244,48 @@ void LoadSettings() {
 }
 
 void RestoreTaskbarAndWorkArea() {
+    g_controlExpand.store(false, std::memory_order_release);
     g_revealedByKeyboard.store(false, std::memory_order_release);
     g_forceHidden.store(false, std::memory_order_release);
     g_loggedAsHidden = false;
+    g_sawLauncher = false;
+    DriveTaskbar(true);
     SetTaskbarsHidden(false, true);
+    RestoreShellAutoHide();
     RestoreWorkArea();
 }
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Initializing keyboard-only taskbar hider");
 
+    InitializeCriticalSection(&g_coordLock);
+    g_coordLockReady = true;
+
     LoadSettings();
 
     if (!InstallHooks()) {
         Wh_Log(L"Failed to install taskbar hooks");
+        DeleteCriticalSection(&g_coordLock);
+        g_coordLockReady = false;
         return FALSE;
     }
 
     // Hooks are applied by the engine after Wh_ModInit returns. Threads start
     // in Wh_ModAfterInit so ShowWindow is already detoured before the first hide.
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_wakeEvent) return FALSE;
+    if (!g_wakeEvent) {
+        DeleteCriticalSection(&g_coordLock);
+        g_coordLockReady = false;
+        return FALSE;
+    }
 
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    g_afterInit.store(true, std::memory_order_release);
+    InstallViewHooks();
+
     g_workerThread = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, nullptr);
     g_keyboardThread = CreateThread(nullptr, 0, KeyboardThreadProc, nullptr, 0, nullptr);
     if (!g_workerThread || !g_keyboardThread) {
@@ -875,6 +1308,10 @@ void Wh_ModUninit() {
     if (g_wakeEvent) {
         CloseHandle(g_wakeEvent);
         g_wakeEvent = nullptr;
+    }
+    if (g_coordLockReady) {
+        DeleteCriticalSection(&g_coordLock);
+        g_coordLockReady = false;
     }
 }
 
