@@ -1,8 +1,9 @@
 // ==WindhawkMod==
 // @id              windows11-app-specific-taskbar-hider
-// @name            Windows 11 App Specific Taskbar Hider
-// @description     Hides the Windows 11 taskbar and blocks accidental hover/edge reveal while selected apps are running
-// @version         1.2
+// @name            Windows 11 Keyboard-Only Taskbar Hider
+// @description     Always hides the taskbar and blocks mouse hover/edge reveal. Press the Windows key to show it.
+// @version         3.0
+// @compilerOptions -ldwmapi -lshell32
 // @author          KWWDCoding
 // @github          https://github.com/kwwdcoding/windows11-app-specific-taskbar-hider
 // @homepage        https://www.kwwd.co.uk
@@ -12,396 +13,311 @@
 
 // ==WindhawkModReadme==
 /*
-# Windows 11 App Specific Taskbar Hider
+# Windows 11 Keyboard-Only Taskbar Hider
 
-Hides the Windows 11 taskbar and Utilises the full screen while one of your
-chosen applications is running (optionally: only while it's focused). Unlike
-just hiding the window, this version also blocks Windows own hover/edge
-auto-reveal, so accidentally moving the mouse into the taskbar's screen area
-(e.g. a timeline scrollbar right at the bottom edge in DaVinci Resolve, or a
-horizontal scrollbar in Photoshop/InDesign) will NOT bring the taskbar back
-or steal focus from your app.
+Hides the Windows 11 taskbar for every application and blocks hover/edge
+auto-reveal. The taskbar comes back when you press the Windows key (or
+Ctrl+Esc), stays up while Start is open, and hides again when Start closes.
 
 ## How it works
 
-Windows shell has its own independent logic that watches the cursor and
-slides the taskbar back in whenever it nears the screen edge - this happens
-regardless of what any external tool did to the window a moment earlier,
-which is why simply hiding it on a timer still let it "pop up" on hover.
+The mod turns on the shell's own auto-hide while it is loaded, then blocks
+only the mouse unhide path (the tray unhide timer, and on Windows 11 the
+pointer-over / screen-edge expand). The Windows key is left alone, so the
+shell runs its normal Start unhide and keeps the bar visible the whole time
+Start is open. The collapsed bar is cloaked so the auto-hide sliver does not
+show.
 
-This mod instead hooks the Windows APIs the shell uses to show/activate the
-taskbar (`ShowWindow`, `SetWindowPos`, `SetForegroundWindow`) and, while your
-condition is active, silently blocks any attempt to show or focus the
-taskbar. The window is simply never allowed to appear, so hovering into its
-area does nothing.
+When the mod is unloaded or the master switch is turned off, the previous
+auto-hide setting is written back.
 
 ## Usage
 
-1. In the mod's settings, list the EXE filenames (just the filename, not the
-   full path) of the apps that should trigger hiding, e.g. `Resolve.exe`,
-   `Photoshop.exe`, `FL64.exe`, `InDesign.exe`.
-2. Choose whether hiding should require the app to be focused, or just
-   running (see the "Require focus" setting).
-3. Enable the mod. You do NOT need to enable Windows' own "Automatically
-   hide the taskbar" setting for this - this mod takes full control instead
-   and it's recommended to leave Windows' own auto-hide OFF to avoid the two
-   fighting each other.
-4. Even with the taskbar hidden, you can still access the Start menu by
-   pressing the Win key (this is deliberately not blocked).
-
-Note: the mod polls the running process / focus state a few times a second,
-so there is a short delay (well under a second) between switching apps and
-the hide state updating. The hover-blocking itself is instant since it
-intercepts the show attempt directly, not on a timer.
+1. Leave Windows' own "Automatically hide the taskbar" **off**. The mod turns
+   that on while it is loaded and restores it when unloaded.
+2. Enable the mod. Hover at the screen edge does nothing.
+3. Press the Windows key. Start opens and the taskbar stays visible with it.
+4. Close Start. The taskbar hides again.
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
 - hideTaskbar: true
-  $name: Enable taskbar auto-hiding
+  $name: Hide the taskbar
   $description: >-
-    Master switch. When enabled, the taskbar will be hidden and its
-    accidental hover/edge reveal blocked, based on the target processes
-    below (see "Require focus").
-- targetProcesses: [Resolve.exe, Photoshop.exe, FL64.exe, InDesign.exe]
-  $name: Target processes
-  $description: >-
-    EXE filenames (no path) that should trigger taskbar hiding, e.g.
-    Resolve.exe, Photoshop.exe, FL64.exe, InDesign.exe. Add or remove entries
-    as needed.
-- requireFocus: true
-  $name: Require focus (not just running)
-  $description: >-
-    If enabled, hiding is only active while one of the target apps is the
-    active/foreground window - switching to another app brings the taskbar
-    back. If disabled, the taskbar stays hidden as long as the target app is
-    running at all, regardless of focus.
+    When enabled, the taskbar stays hidden and mouse hover cannot reveal it.
+    Press the Windows key to show it. Turn this off to restore normal behavior.
 */
 // ==/WindhawkModSettings==
 
 #include <windows.h>
-#include <tlhelp32.h>
+#include <dwmapi.h>
+#include <shellapi.h>
 #include <windhawk_utils.h>
 
-#include <string>
-#include <vector>
 #include <atomic>
 
-struct {
-    bool hideTaskbar;
-    bool requireFocus;
-    std::vector<std::wstring> targetProcesses;
-} settings;
+#ifndef DWMWA_CLOAK
+#define DWMWA_CLOAK 13
+#endif
 
-// Guards `settings` between the settings-load calls (main thread) and the
-// polling thread / hooks reading it.
-CRITICAL_SECTION g_settingsLock;
+// TrayUI mouse-unhide timer. The Windows key does not use this id.
+constexpr UINT_PTR kTrayTimerUnhide = 3;
+// ViewCoordinator::UpdateIsExpanded reasons that mean "the pointer did this".
+constexpr int kReasonPointerOver = 7;
+constexpr int kReasonEdgeStroke = 8;
 
-HANDLE g_pollThread = nullptr;
-std::atomic<bool> g_stopPolling{false};
+std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_afterInit{false};
 
-// The single source of truth the hooks check: while true, any attempt to
-// show/activate/reposition-into-view the taskbar is blocked.
-std::atomic<bool> g_forceHidden{false};
+bool g_autoHideSaved = false;
+UINT g_originalAppBarState = 0;
+bool g_viewHooksReady = false;
 
-HWND g_taskbarHwnd = nullptr;
+using SetTimer_t = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC);
+SetTimer_t g_origSetTimer = nullptr;
 
-// ---------------------------------------------------------------------
-// Taskbar visibility helpers
-// ---------------------------------------------------------------------
+using DwmSetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+DwmSetWindowAttribute_t g_origDwmSetWindowAttribute = nullptr;
 
-HWND FindTaskbarWindow() {
-    return FindWindow(L"Shell_TrayWnd", NULL);
+using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+LoadLibraryExW_t g_origLoadLibraryExW = nullptr;
+
+using ViewIsExpanded_t = bool(WINAPI*)(void* pThis, HWND hwnd);
+ViewIsExpanded_t g_origIsExpanded = nullptr;
+
+using ViewUpdateExpanded_t = void(WINAPI*)(void* pThis, HWND hwnd, int reason);
+ViewUpdateExpanded_t g_origUpdateExpanded = nullptr;
+
+bool ClassIs(HWND hwnd, const wchar_t* name) {
+    WCHAR cls[64];
+    if (!hwnd || !GetClassNameW(hwnd, cls, ARRAYSIZE(cls))) return false;
+    return _wcsicmp(cls, name) == 0;
 }
 
-void AdjustWorkArea(bool useFullScreen) {
-    MONITORINFO mi = { sizeof(mi) };
-    HMONITOR hMonitor = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
-
-    if (GetMonitorInfo(hMonitor, &mi)) {
-        RECT rcWork = mi.rcMonitor;
-
-        if (!useFullScreen) {
-            SystemParametersInfo(SPI_GETWORKAREA, 0, &rcWork, 0);
-        } else {
-            rcWork = mi.rcMonitor;
-            SystemParametersInfo(SPI_SETWORKAREA, 0, &rcWork, SPIF_SENDCHANGE | SPIF_UPDATEINIFILE);
-        }
-    }
+bool IsTaskbarFrame(HWND hwnd) {
+    return ClassIs(hwnd, L"Shell_TrayWnd") || ClassIs(hwnd, L"Shell_SecondaryTrayWnd");
 }
 
-// Actually moves the window and updates the work area. Safe to call this
-// with real ShowWindow/SetWindowPos since our hooks only block *show*
-// attempts while g_forceHidden is true - hiding always passes through.
-void ApplyTaskbarVisibility(bool hide) {
-    HWND hTaskbar = g_taskbarHwnd ? g_taskbarHwnd : FindTaskbarWindow();
-    if (hTaskbar) {
-        if (hide) {
-            ShowWindow(hTaskbar, SW_HIDE);
-            AdjustWorkArea(true);
-        } else {
-            ShowWindow(hTaskbar, SW_SHOW);
-            AdjustWorkArea(false);
-        }
+int CollectTaskbars(HWND* out, int capacity) {
+    int count = 0;
+    HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (primary && count < capacity) out[count++] = primary;
+
+    HWND after = nullptr;
+    while (count < capacity) {
+        HWND secondary = FindWindowExW(nullptr, after, L"Shell_SecondaryTrayWnd", nullptr);
+        if (!secondary || secondary == after || secondary == primary) break;
+        out[count++] = secondary;
+        after = secondary;
     }
+    return count;
 }
 
-bool ExeNameMatches(const std::wstring& a, const std::wstring& b) {
-    if (a.size() != b.size()) return false;
-    return _wcsicmp(a.c_str(), b.c_str()) == 0;
-}
-
-std::wstring GetForegroundProcessExeName() {
-    HWND hWnd = GetForegroundWindow();
-    if (!hWnd) {
-        return L"";
-    }
-
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hWnd, &pid);
-    if (!pid) {
-        return L"";
-    }
-
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProcess) {
-        return L"";
-    }
-
-    WCHAR buffer[MAX_PATH];
-    DWORD size = MAX_PATH;
-    std::wstring result;
-
-    if (QueryFullProcessImageNameW(hProcess, 0, buffer, &size)) {
-        std::wstring fullPath(buffer);
-        size_t pos = fullPath.find_last_of(L"\\/");
-        result = (pos == std::wstring::npos) ? fullPath : fullPath.substr(pos + 1);
-    }
-
-    CloseHandle(hProcess);
-    return result;
-}
-
-bool IsAnyTargetProcessFocused() {
-    std::vector<std::wstring> targets;
-    {
-        EnterCriticalSection(&g_settingsLock);
-        targets = settings.targetProcesses;
-        LeaveCriticalSection(&g_settingsLock);
-    }
-    if (targets.empty()) return false;
-
-    std::wstring foregroundExe = GetForegroundProcessExeName();
-    if (foregroundExe.empty()) return false;
-
-    for (const auto& target : targets) {
-        if (ExeNameMatches(foregroundExe, target)) return true;
-    }
-    return false;
-}
-
-bool IsAnyTargetProcessRunning() {
-    std::vector<std::wstring> targets;
-    {
-        EnterCriticalSection(&g_settingsLock);
-        targets = settings.targetProcesses;
-        LeaveCriticalSection(&g_settingsLock);
-    }
-    if (targets.empty()) return false;
-
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
-
-    bool found = false;
-    PROCESSENTRY32W pe;
-    pe.dwSize = sizeof(pe);
-
-    if (Process32FirstW(hSnapshot, &pe)) {
-        do {
-            for (const auto& target : targets) {
-                if (ExeNameMatches(pe.szExeFile, target)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) break;
-        } while (Process32NextW(hSnapshot, &pe));
-    }
-
-    CloseHandle(hSnapshot);
-    return found;
-}
-
-// Recomputes whether hiding should be active and applies it. This drives
-// both the "hide it now" action and the g_forceHidden flag the hooks below
-// check on every show/activate attempt.
-void UpdateTaskbarState() {
-    bool masterEnabled;
-    bool requireFocus;
-    {
-        EnterCriticalSection(&g_settingsLock);
-        masterEnabled = settings.hideTaskbar;
-        requireFocus = settings.requireFocus;
-        LeaveCriticalSection(&g_settingsLock);
-    }
-
-    bool conditionMet = requireFocus ? IsAnyTargetProcessFocused()
-                                      : IsAnyTargetProcessRunning();
-    bool shouldHide = masterEnabled && conditionMet;
-
-    bool wasHidden = g_forceHidden.exchange(shouldHide);
-    if (shouldHide != wasHidden) {
-        Wh_Log(L"Condition changed, %s taskbar", shouldHide ? L"hiding" : L"showing");
-        ApplyTaskbarVisibility(shouldHide);
+void CloakWindow(HWND hwnd, BOOL cloak) {
+    if (!IsWindow(hwnd)) return;
+    if (g_origDwmSetWindowAttribute) {
+        g_origDwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+    } else {
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
     }
 }
 
-// ---------------------------------------------------------------------
-// API hooks: block anything that would show/activate the taskbar while
-// g_forceHidden is set, so hovering into its screen area can't reveal it.
-// ---------------------------------------------------------------------
-
-using ShowWindow_t = BOOL(WINAPI*)(HWND, int);
-ShowWindow_t g_origShowWindow;
-
-BOOL WINAPI Hook_ShowWindow(HWND hWnd, int nCmdShow) {
-    if (g_forceHidden && hWnd == g_taskbarHwnd) {
-        switch (nCmdShow) {
-            case SW_SHOW:
-            case SW_SHOWNA:
-            case SW_SHOWNORMAL:
-            case SW_SHOWNOACTIVATE:
-            case SW_RESTORE:
-                return TRUE; // pretend it worked, do nothing
-        }
-    }
-    return g_origShowWindow(hWnd, nCmdShow);
+void CloakAllTaskbars(BOOL cloak) {
+    HWND bars[16];
+    int count = CollectTaskbars(bars, ARRAYSIZE(bars));
+    for (int i = 0; i < count; i++) CloakWindow(bars[i], cloak);
 }
 
-using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
-SetWindowPos_t g_origSetWindowPos;
-
-BOOL WINAPI Hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y,
-                               int cx, int cy, UINT uFlags) {
-    if (g_forceHidden && hWnd == g_taskbarHwnd) {
-        // Strip any show/activate intent, force it to stay hidden.
-        uFlags &= ~SWP_SHOWWINDOW;
-        uFlags |= SWP_NOACTIVATE | SWP_HIDEWINDOW;
+void EnsureShellAutoHide() {
+    APPBARDATA abd = {sizeof(abd)};
+    abd.hWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    UINT state = (UINT)SHAppBarMessage(ABM_GETSTATE, &abd);
+    if (!g_autoHideSaved) {
+        g_originalAppBarState = state;
+        g_autoHideSaved = true;
+        Wh_Log(L"Saved taskbar state 0x%X", state);
     }
-    return g_origSetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+    if (state & ABS_AUTOHIDE) return;
+
+    abd.lParam = (LPARAM)(state | ABS_AUTOHIDE);
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    Wh_Log(L"Enabled shell auto-hide");
 }
 
-using SetForegroundWindow_t = BOOL(WINAPI*)(HWND);
-SetForegroundWindow_t g_origSetForegroundWindow;
-
-BOOL WINAPI Hook_SetForegroundWindow(HWND hWnd) {
-    if (g_forceHidden && hWnd == g_taskbarHwnd) {
-        return FALSE;
-    }
-    return g_origSetForegroundWindow(hWnd);
+void RestoreShellAutoHide() {
+    if (!g_autoHideSaved) return;
+    APPBARDATA abd = {sizeof(abd)};
+    abd.hWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    abd.lParam = (LPARAM)(g_originalAppBarState & (ABS_AUTOHIDE | ABS_ALWAYSONTOP));
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    Wh_Log(L"Restored taskbar state 0x%X", (UINT)abd.lParam);
+    g_autoHideSaved = false;
 }
 
-void InstallHooks() {
-    HMODULE hUser32 = GetModuleHandle(L"user32.dll");
-    if (!hUser32) return;
-
-    void* pShowWindow = (void*)GetProcAddress(hUser32, "ShowWindow");
-    void* pSetWindowPos = (void*)GetProcAddress(hUser32, "SetWindowPos");
-    void* pSetForegroundWindow = (void*)GetProcAddress(hUser32, "SetForegroundWindow");
-
-    if (pShowWindow) {
-        Wh_SetFunctionHook(pShowWindow, (void*)Hook_ShowWindow, (void**)&g_origShowWindow);
-    }
-    if (pSetWindowPos) {
-        Wh_SetFunctionHook(pSetWindowPos, (void*)Hook_SetWindowPos, (void**)&g_origSetWindowPos);
-    }
-    if (pSetForegroundWindow) {
-        Wh_SetFunctionHook(pSetForegroundWindow, (void*)Hook_SetForegroundWindow, (void**)&g_origSetForegroundWindow);
+void ApplyEnabledState() {
+    if (g_enabled.load(std::memory_order_acquire)) {
+        EnsureShellAutoHide();
+        // Only cloak when we can uncloak again through ViewCoordinator.
+        if (g_viewHooksReady) CloakAllTaskbars(TRUE);
+    } else {
+        CloakAllTaskbars(FALSE);
+        RestoreShellAutoHide();
     }
 }
 
-// ---------------------------------------------------------------------
-// Polling thread: keeps the condition (running/focused target app) up to
-// date. The actual hover-blocking is instant via the hooks above; this
-// just decides *when* g_forceHidden should be true or false.
-// ---------------------------------------------------------------------
-
-DWORD WINAPI PollThreadProc(LPVOID) {
-    while (!g_stopPolling) {
-        UpdateTaskbarState();
-        for (int i = 0; i < 3 && !g_stopPolling; i++) {
-            Sleep(100);
-        }
+UINT_PTR WINAPI Hook_SetTimer(HWND hwnd, UINT_PTR id, UINT elapse, TIMERPROC proc) {
+    // Block the mouse unhide timer. The Windows key unhides through the shell,
+    // not this timer.
+    if (id == kTrayTimerUnhide && IsTaskbarFrame(hwnd) &&
+        g_enabled.load(std::memory_order_acquire)) {
+        return id ? id : 1;
     }
-    return 0;
+    return g_origSetTimer(hwnd, id, elapse, proc);
 }
 
-void StartPollThread() {
-    g_stopPolling = false;
-    g_pollThread = CreateThread(nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
+HRESULT WINAPI Hook_DwmSetWindowAttribute(HWND hwnd, DWORD attribute, LPCVOID data,
+                                          DWORD size) {
+    // Keep the collapsed bar cloaked: reject uncloak while we are hiding.
+    if (attribute == DWMWA_CLOAK && IsTaskbarFrame(hwnd) && data && size >= sizeof(BOOL) &&
+        g_enabled.load(std::memory_order_acquire) && !*(const BOOL*)data) {
+        return S_OK;
+    }
+    return g_origDwmSetWindowAttribute(hwnd, attribute, data, size);
 }
 
-void StopPollThread() {
-    if (g_pollThread) {
-        g_stopPolling = true;
-        WaitForSingleObject(g_pollThread, 5000);
-        CloseHandle(g_pollThread);
-        g_pollThread = nullptr;
+void WINAPI Hook_UpdateExpanded(void* pThis, HWND hwnd, int reason) {
+    // Block pointer-over and screen-edge expand. Leave every other reason alone
+    // so the Windows key / Start can expand the bar normally.
+    if (g_enabled.load(std::memory_order_acquire) &&
+        (reason == kReasonPointerOver || reason == kReasonEdgeStroke)) {
+        return;
     }
+
+    g_origUpdateExpanded(pThis, hwnd, reason);
+
+    if (!g_enabled.load(std::memory_order_acquire) || !g_origIsExpanded) return;
+    bool expanded = g_origIsExpanded(pThis, hwnd);
+    CloakWindow(hwnd, expanded ? FALSE : TRUE);
+}
+
+bool InstallViewHooks(HMODULE module);
+void TryInstallViewHooks();
+
+HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
+    HMODULE module = g_origLoadLibraryExW(name, file, flags);
+    if (!module || !name || g_viewHooksReady) return module;
+
+    const wchar_t* base = wcsrchr(name, L'\\');
+    base = base ? base + 1 : name;
+    if (_wcsicmp(base, L"Taskbar.View.dll") == 0 ||
+        _wcsicmp(base, L"ExplorerExtensions.dll") == 0) {
+        InstallViewHooks(module);
+    }
+    return module;
+}
+
+bool InstallViewHooks(HMODULE module) {
+    if (!module || g_viewHooksReady) return g_viewHooksReady;
+
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {LR"(public: bool __cdecl winrt::Taskbar::implementation::ViewCoordinator::IsExpanded(unsigned __int64))"},
+            &g_origIsExpanded,
+            nullptr,
+            true,
+        },
+        {
+            {LR"(public: void __cdecl winrt::Taskbar::implementation::ViewCoordinator::UpdateIsExpanded(unsigned __int64,enum TaskbarTipTest::TaskbarExpandCollapseReason))"},
+            &g_origUpdateExpanded,
+            Hook_UpdateExpanded,
+            true,
+        },
+    };
+
+    if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"ViewCoordinator symbols not found in module");
+        return false;
+    }
+
+    if (!g_origUpdateExpanded) {
+        Wh_Log(L"UpdateIsExpanded not resolved");
+        return false;
+    }
+
+    g_viewHooksReady = true;
+    Wh_Log(L"Hooked ViewCoordinator");
+    if (g_afterInit.load(std::memory_order_acquire)) Wh_ApplyHookOperations();
+    return true;
+}
+
+void TryInstallViewHooks() {
+    if (g_viewHooksReady) return;
+    HMODULE view = GetModuleHandleW(L"Taskbar.View.dll");
+    if (view && InstallViewHooks(view)) return;
+    HMODULE ext = GetModuleHandleW(L"ExplorerExtensions.dll");
+    if (ext && ext != view) InstallViewHooks(ext);
+}
+
+bool InstallHooks() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return false;
+
+    void* setTimer = (void*)GetProcAddress(user32, "SetTimer");
+    if (!setTimer ||
+        !Wh_SetFunctionHook(setTimer, (void*)Hook_SetTimer, (void**)&g_origSetTimer)) {
+        return false;
+    }
+
+    HMODULE dwmapi = GetModuleHandleW(L"dwmapi.dll");
+    if (!dwmapi) dwmapi = LoadLibraryW(L"dwmapi.dll");
+    void* dwmAttr = dwmapi ? (void*)GetProcAddress(dwmapi, "DwmSetWindowAttribute") : nullptr;
+    if (dwmAttr) {
+        Wh_SetFunctionHook(dwmAttr, (void*)Hook_DwmSetWindowAttribute,
+                           (void**)&g_origDwmSetWindowAttribute);
+    }
+
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    void* loadLib = kernelBase ? (void*)GetProcAddress(kernelBase, "LoadLibraryExW") : nullptr;
+    if (loadLib) {
+        Wh_SetFunctionHook(loadLib, (void*)Hook_LoadLibraryExW, (void**)&g_origLoadLibraryExW);
+    }
+
+    TryInstallViewHooks();
+    return true;
 }
 
 void LoadSettings() {
-    EnterCriticalSection(&g_settingsLock);
-
-    settings.hideTaskbar = Wh_GetIntSetting(L"hideTaskbar");
-    settings.requireFocus = Wh_GetIntSetting(L"requireFocus");
-
-    settings.targetProcesses.clear();
-    for (int i = 0;; i++) {
-        PCWSTR value = Wh_GetStringSetting(L"targetProcesses[%d]", i);
-        bool stop = !value || !*value;
-        if (!stop) {
-            settings.targetProcesses.push_back(value);
-        }
-        Wh_FreeStringSetting(value);
-        if (stop) break;
-    }
-
-    LeaveCriticalSection(&g_settingsLock);
+    g_enabled.store(Wh_GetIntSetting(L"hideTaskbar") != 0, std::memory_order_release);
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Initializing Windows 11 App Specific Taskbar Hider");
-
-    InitializeCriticalSection(&g_settingsLock);
-    g_taskbarHwnd = FindTaskbarWindow();
-
+    Wh_Log(L"Initializing keyboard-only taskbar hider");
     LoadSettings();
-    InstallHooks();
-
-    g_forceHidden = false;
-    UpdateTaskbarState();
-
-    StartPollThread();
-
+    if (!InstallHooks()) {
+        Wh_Log(L"Failed to install hooks");
+        return FALSE;
+    }
     return TRUE;
 }
 
+void Wh_ModAfterInit() {
+    g_afterInit.store(true, std::memory_order_release);
+    TryInstallViewHooks();
+    ApplyEnabledState();
+}
+
+void Wh_ModBeforeUninit() {
+    CloakAllTaskbars(FALSE);
+    RestoreShellAutoHide();
+}
+
 void Wh_ModUninit() {
-    Wh_Log(L"Uninitializing Windows 11 App Specific Taskbar Hider");
-
-    StopPollThread();
-
-    g_forceHidden = false; // let a real ShowWindow(SW_SHOW) through
-    ApplyTaskbarVisibility(false);
-
-    DeleteCriticalSection(&g_settingsLock);
+    Wh_Log(L"Uninitialized");
 }
 
 void Wh_ModSettingsChanged() {
-    Wh_Log(L"Settings changed");
-
     LoadSettings();
-    UpdateTaskbarState();
+    ApplyEnabledState();
 }
