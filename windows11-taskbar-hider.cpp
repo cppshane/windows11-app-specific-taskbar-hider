@@ -167,7 +167,6 @@ bool IsShowCommand(int nCmdShow) {
         case SW_RESTORE:
         case SW_SHOWDEFAULT:
         case SW_MAXIMIZE:
-        case SW_SHOWMAXIMIZED:
             return true;
     }
     return false;
